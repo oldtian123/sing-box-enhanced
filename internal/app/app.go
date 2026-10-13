@@ -98,6 +98,9 @@ func Run(args []string, out io.Writer) error {
 	if args[0] == "daemon" {
 		return daemon(o, out)
 	}
+	if args[0] == "admin" {
+		return runAdmin(o, args[1:], out, os.Stdin)
+	}
 	if len(args) >= 2 && args[0] == "warp" {
 		switch args[1] {
 		case "register":
@@ -932,6 +935,9 @@ func protect(o options) error {
 }
 
 const helpText = `233Boy sing-box Enhanced (开发版，GPL-3.0)
+sb admin setup [--name admin] [--password-stdin] （首次配置应用管理员）
+sb admin show | rename --name NEW_NAME | passwd [--password-stdin]
+管理员密码用于后续面板登录；不传密码时生成随机密码，凭据保存在 root 私有文件。
 sb account create --name NAME --bytes MONTHLY_BYTES
 sb account create --name NAME --unlimited
 sb account list | enable/disable/quota/reset/recover/delete --id NAME_OR_ID [--bytes N]

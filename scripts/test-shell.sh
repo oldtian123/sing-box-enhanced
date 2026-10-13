@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 
 # Tests only the shell routing and installation contract with fake binaries.
 # These checks do not demonstrate real sing-box traffic or WARP connectivity.
@@ -11,14 +12,53 @@ printf 'managed-v1\n' >"$fixture/root/managed.marker"
 printf '{}\n' >"$fixture/legacy/config.json"
 cat >"$fixture/helper" <<'HELPER'
 #!/bin/bash
+umask 077
 printf '<%s>\n' "$@" >"$SBE_TEST_LOG"
 printf '<%s>\n' "$@" >>"$SBE_TEST_HISTORY"
+[[ ${SBE_TEST_EXIT:-0} == 0 ]] || exit "$SBE_TEST_EXIT"
+helper_root=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --root) helper_root=$2; shift 2 ;;
+    --core | --unit-dir) shift 2 ;;
+    *) break ;;
+    esac
+done
+if [[ ${1:-} == admin ]]; then
+    operation=${2:-}
+    case $operation in
+    show)
+        if [[ ${SBE_TEST_ADMIN_PRESENT:-0} == 1 || -f $helper_root/admin-fixture.marker ]]; then
+            printf '%s\n' '{"id":"fixture-admin","name":"admin","unlimited":true}'
+            exit 0
+        fi
+        exit 1
+        ;;
+    setup)
+        [[ ${SBE_TEST_ADMIN_PRESENT:-0} == 0 && ! -f $helper_root/admin-fixture.marker ]] || exit 1
+        [[ ${SBE_TEST_SETUP_FAIL:-0} == 0 ]] || exit 9
+        ;;
+    esac
+    for argument in "$@"; do
+        if [[ $argument == --password-stdin ]]; then
+            IFS= read -r password || exit 1
+            printf '%s' "$password" >"$SBE_TEST_STDIN_LOG"
+        fi
+    done
+    if [[ $operation == setup ]]; then
+        mkdir -p "$helper_root"
+        printf '%s\n' 'fixture-admin' >"$helper_root/admin-fixture.marker"
+        printf '%s\n' '{"password":"fixture-random-password"}' >"$helper_root/admin.initial-credentials.json"
+        printf 'Initial credentials: %s\n' "$helper_root/admin.initial-credentials.json"
+    fi
+fi
 exit "${SBE_TEST_EXIT:-0}"
 HELPER
 chmod +x "$fixture/helper"
 export SBE_ROOT="$fixture/root" SBE_BIN="$fixture/helper" SBE_CORE="$fixture/core"
 export SBE_TEST_LOG="$fixture/call" SBE_UNIT_DIR="$fixture/units"
 export SBE_TEST_HISTORY="$fixture/history"
+export SBE_TEST_STDIN_LOG="$fixture/stdin"
 
 run_menu() {
     printf '%s\n' "$@" | bash "$repo/sing-box.sh" >"$fixture/menu" 2>&1
@@ -96,6 +136,26 @@ run_menu 24 'menu name' localhost '' 0
 [[ $(cat "$fixture/call") == *$'<node>\n<qr>\n<--account>\n<menu name>\n<--server>\n<localhost>' ]]
 run_menu 25 0
 [[ $(cat "$fixture/call") == *$'<service>\n<log>' ]]
+run_menu 26 0
+[[ $(cat "$fixture/call") == *$'<admin>\n<show>' ]]
+run_menu 27 'admin name with spaces' 0
+[[ $(cat "$fixture/call") == *$'<admin>\n<rename>\n<--name>\n<admin name with spaces>' ]]
+password='fixture-password; $(touch ignored)'
+run_menu 28 "$password" "$password" 0
+[[ $(cat "$fixture/call") == *$'<admin>\n<passwd>\n<--password-stdin>' ]]
+[[ $(cat "$fixture/stdin") == "$password" ]]
+[[ $(cat "$fixture/call") != *"$password"* && $(cat "$fixture/menu") != *"$password"* ]]
+rm -f "$fixture/call" "$fixture/stdin"
+run_menu 28 first different 0
+[[ ! -e $fixture/call && ! -e $fixture/stdin ]]
+run_menu 28 '' '' 0
+[[ ! -e $fixture/call && ! -e $fixture/stdin ]]
+printf '%s\n' "$password" | bash "$repo/sing-box.sh" admin passwd --password-stdin >/dev/null
+[[ $(cat "$fixture/stdin") == "$password" ]]
+[[ $(cat "$fixture/call") == *$'<admin>\n<passwd>\n<--password-stdin>' && $(cat "$fixture/call") != *"$password"* ]]
+rm -f "$fixture/stdin"
+printf '%s\n' 28 "$password" "$password" 0 | bash -x "$repo/sing-box.sh" >"$fixture/traced-menu" 2>&1
+[[ $(cat "$fixture/traced-menu") != *"$password"* ]]
 
 for blocked in add change del passwd test run bin update uninstall dns import fix-all main-extra; do
     rm -f "$fixture/call"
@@ -146,11 +206,16 @@ bash "$repo/sing-box.sh" account list
 [[ $(cat "$fixture/call") == *'<account>'* ]]
 
 if [[ $EUID == 0 ]]; then
+    rm -f "$fixture/history" "$fixture/stdin"
     bash "$repo/install.sh" --enhanced --root "$fixture/installed" \
         --core "$fixture/helper" --helper "$fixture/helper" --entry "$fixture/entry" \
         --unit-dir "$fixture/install-units" --no-start >/dev/null
     [[ -f $fixture/installed/sh/scripts/install-warp.sh ]]
     [[ -f $fixture/installed/managed.marker ]]
+    [[ -f $fixture/installed/admin.initial-credentials.json ]]
+    [[ $(cat "$fixture/history") == *$'<admin>\n<show>'* ]]
+    [[ $(cat "$fixture/history") == *$'<admin>\n<setup>\n<--name>\n<admin>'* ]]
+    [[ ! -e $fixture/stdin ]]
     [[ $(cat "$fixture/install-units/sing-box-enhanced-meter.service") == *'service protect'* ]]
     bash "$fixture/entry" node list
     [[ $(cat "$fixture/call") == *'<node>'* ]]
@@ -161,6 +226,26 @@ if [[ $EUID == 0 ]]; then
         exit 1
     fi
     [[ ! -e $fixture/other ]]
+    printf '%s\n' "$password" | bash "$repo/install.sh" --enhanced --root "$fixture/custom" \
+        --core "$fixture/helper" --helper "$fixture/helper" --entry "$fixture/custom-entry" \
+        --unit-dir "$fixture/custom-units" --admin-name 'custom admin' --admin-password-stdin --no-start >"$fixture/install-output"
+    [[ $(cat "$fixture/call") == *$'<admin>\n<setup>\n<--name>\n<custom admin>\n<--password-stdin>' ]]
+    [[ $(cat "$fixture/stdin") == "$password" ]]
+    [[ $(cat "$fixture/install-output") != *"$password"* && $(cat "$fixture/call") != *"$password"* ]]
+    if SBE_TEST_ADMIN_PRESENT=1 bash "$repo/install.sh" --enhanced --root "$fixture/already-admin" \
+        --core "$fixture/helper" --helper "$fixture/helper" --entry "$fixture/already-entry" \
+        --unit-dir "$fixture/already-units" --no-start >/dev/null 2>&1; then
+        printf '%s\n' 'FAIL：安装器覆盖已有应用管理员' >&2
+        exit 1
+    fi
+    [[ ! -e $fixture/already-admin && ! -e $fixture/already-entry ]]
+    if SBE_TEST_SETUP_FAIL=1 bash "$repo/install.sh" --enhanced --root "$fixture/setup-failed" \
+        --core "$fixture/helper" --helper "$fixture/helper" --entry "$fixture/failed-entry" \
+        --unit-dir "$fixture/failed-units" --no-start >/dev/null 2>&1; then
+        printf '%s\n' 'FAIL：管理员初始化失败后继续安装' >&2
+        exit 1
+    fi
+    [[ ! -e $fixture/failed-entry && ! -e $fixture/setup-failed/managed.marker && ! -e $fixture/failed-units/sing-box-enhanced-meter.service ]]
 else
     if bash "$repo/install.sh" --enhanced --root "$fixture/installed" \
         --core "$fixture/helper" --helper "$fixture/helper" --entry "$fixture/entry" \
@@ -170,4 +255,4 @@ else
     fi
     [[ ! -e $fixture/installed ]]
 fi
-printf '%s\n' 'PASS：参数保留、配额/只读别名、旧写路径拦截、安全交互菜单、显式 WARP 条款、迁移门禁、错误码及安装保护'
+printf '%s\n' 'PASS：参数保留、配额/只读别名、旧写路径拦截、安全交互菜单、管理员密码 stdin/隐藏输入、显式 WARP 条款、迁移门禁、错误码及安装保护'

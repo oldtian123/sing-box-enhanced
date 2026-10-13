@@ -10,10 +10,14 @@ usage() {
   --helper <路径>     本地 Go 管理程序可执行文件
   --entry <路径>      命令入口，默认 /usr/local/bin/sb
   --unit-dir <路径>   systemd unit 目录，默认 /etc/systemd/system
+  --admin-name <名字> 应用管理员名字，默认 admin，月额度无限
+  --admin-password-stdin 从标准输入读取自定义管理员密码，禁止通过参数传密码
   --no-start          仅安装，不启动计量守护进程
   -h, --help          显示帮助
 安装只使用本地产物，不安装工具链、不下载核心、不创建 Linux 账户。
 已有原 sb 时请使用 --entry /usr/local/bin/sb-enhanced；迁移需单独执行。
+默认生成随机管理员密码，仅保存在 root 可读的初始凭据文件，输出文件路径。
+已有增强安装或应用管理员时拒绝覆盖；应用管理员不是 Linux 系统账户。
 HELP
 }
 
@@ -28,9 +32,11 @@ helper_source=
 entry=/usr/local/bin/sb
 unit_dir=/etc/systemd/system
 no_start=0
+admin_name=admin
+admin_password_stdin=0
 while [[ $# -gt 0 ]]; do
     case $1 in
-    --root | --core | --helper | --entry | --unit-dir)
+    --root | --core | --helper | --entry | --unit-dir | --admin-name)
         [[ $# -ge 2 && -n $2 ]] || fail "$1 缺少参数"
         case $1 in
         --root) root=$2 ;;
@@ -38,10 +44,12 @@ while [[ $# -gt 0 ]]; do
         --helper) helper_source=$2 ;;
         --entry) entry=$2 ;;
         --unit-dir) unit_dir=$2 ;;
+        --admin-name) admin_name=$2 ;;
         esac
         shift 2
         ;;
     --no-start) no_start=1; shift ;;
+    --admin-password-stdin) admin_password_stdin=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) fail "未知参数：$1" ;;
     esac
@@ -78,6 +86,10 @@ if [[ $no_start == 0 ]]; then
     [[ -d /run/systemd/system ]] || fail 'systemd 未运行；可使用 --no-start 仅安装'
 fi
 
+if "$helper_source" --root "$root" --core "$core_source" --unit-dir "$unit_dir" admin show >/dev/null 2>&1; then
+    fail '目标目录已有应用管理员，未覆盖；请使用 sb admin rename/passwd 管理'
+fi
+
 install -d -m 0700 "$root" "$root/bin" "$root/sh" "$root/sh/src" "$root/sh/scripts" \
     "$root/instances" "$root/backups"
 install -m 0700 "$core_source" "$root/bin/sing-box"
@@ -85,6 +97,10 @@ install -m 0700 "$helper_source" "$root/bin/sbe"
 install -m 0600 "$script_root/src/enhanced.sh" "$root/sh/src/enhanced.sh"
 install -m 0700 "$script_root/scripts/sb-enhanced.sh" "$root/sh/scripts/sb-enhanced.sh"
 install -m 0700 "$script_root/scripts/install-warp.sh" "$root/sh/scripts/install-warp.sh"
+admin_setup_args=(admin setup --name "$admin_name")
+[[ $admin_password_stdin == 0 ]] || admin_setup_args+=(--password-stdin)
+"$root/bin/sbe" --root "$root" --core "$root/bin/sing-box" --unit-dir "$unit_dir" \
+    "${admin_setup_args[@]}" || fail '应用管理员初始化失败，未安装入口或启动服务'
 mkdir -p -- "$(dirname -- "$entry")" "$unit_dir"
 
 entry_tmp=$(mktemp "$(dirname -- "$entry")/.sbe-entry.XXXXXX")
@@ -130,7 +146,8 @@ if [[ $no_start == 0 ]]; then
     systemctl enable --now sing-box-enhanced-meter.service
 fi
 printf '增强版已安装：%s\n' "$entry"
-printf '%s\n' '未生成默认节点，未迁移或重启原 sing-box；请先创建账号，再绑定受管节点。'
+printf '%s\n' '已初始化无限月额度的应用管理员；未生成默认节点，未迁移或重启原 sing-box。'
+printf '%s\n' '可绑定管理员账号的受管节点，或另外创建固定额度应用账号。'
 if [[ $no_start == 1 ]]; then
     printf '%s\n' '计量守护进程尚未启动，使用受管节点前必须启动它。'
 fi

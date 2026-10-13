@@ -21,7 +21,7 @@ Naive 出站仍依赖 `libcronet.so`，此构建不代表该附加出站已经�
 
 ```bash
 sb-enhanced account create --name alice --bytes 107374182400
-sb-enhanced account create --name admin --unlimited
+sb-enhanced admin show
 sb-enhanced node add --name hy2 --template /path/to/single-inbound-node.json
 sb-enhanced node bind --node hy2 --account alice
 sb-enhanced node endpoints --account alice
@@ -51,6 +51,28 @@ Caddy需要公网端口。默认保留客户端TLS校验，自签场景只有显
 `node endpoints` 含实际认证信息，仅供本机 root 查看；没有订阅 HTTP 链接。
 SQLite、凭据、配置、备份均在私有数据目录。管理操作与守护进程共用文件锁。
 接管后的增强入口拦截原脚本写入/裸启动/更新路径，避免直接覆盖受管配置。
+
+## 应用管理员
+
+安装默认创建名为 `admin` 的无限额度应用账号和管理员身份。该身份用于后续面板登录，
+本期没有登录 API；本机管理仍由 root 执行。应用密码与协议凭据、Linux root 密码完全独立。
+默认生成随机密码，数据库仅存 Argon2id 哈希；初始名字和密码写入数据目录的
+`admin.initial-credentials.json`，权限0600。命令和审计不输出密码/哈希。
+取走初始凭据后可删除该文件；自定义密码不会写入这个明文文件。
+
+```bash
+sb admin show
+sb admin rename --name YOUR_ADMIN_NAME
+sb admin passwd                    # 生成新随机密码，输出私有凭据文件路径
+sb admin passwd --password-stdin   # 从标准输入读取一行密码，也可使用隐藏输入菜单
+```
+
+自定义密码为12到1024字节，不允许换行；不要把密码写到命令参数或Shell历史里。
+安装支持 `--admin-name`、`--admin-password-stdin`。已有实例升级后需一次性执行
+`sb admin setup [--name admin]`；若存在同名账号，会保留其ID、账本、绑定和保护状态，
+仅设置无限额度及管理员哈希。重复 setup 拒绝覆盖，改名和密码轮换不会重启核心。
+SQLite v1/v2 自动迁移到v3；运行中的旧计量程序不能打开v3，所以替换旧程序前应备份数据库、
+停止计量服务，升级完成再启动并核实计划停机造成的故障保护后恢复账号。
 
 ## 计量与配额
 

@@ -2,10 +2,12 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -288,7 +290,7 @@ func TestStoragePermissionsPragmasAndFutureSchema(t *testing.T) {
 			t.Fatal("replacement connection did not enforce foreign keys")
 		}
 	}
-	if _, err := s.DB.Exec("PRAGMA user_version = 3"); err != nil {
+	if _, err := s.DB.Exec("PRAGMA user_version = 4"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -452,6 +454,7 @@ func TestSchemaV1MigrationPreservesFixedAccountsAndLedgers(t *testing.T) {
 		"INSERT INTO instances(account_id, stats_port, generation, process_id, config_hash) VALUES ('a', 31111, 'old-generation', 'old-process', 'old-hash')",
 		"INSERT INTO settings(key, value) VALUES ('custom_setting', 'preserved')",
 		// Remove the v2-only column to create an actual v1 schema fixture.
+		"DROP TABLE administrators",
 		"ALTER TABLE accounts DROP COLUMN unlimited",
 		"PRAGMA user_version = 1",
 	} {
@@ -496,5 +499,283 @@ func TestSchemaV1MigrationPreservesFixedAccountsAndLedgers(t *testing.T) {
 	status, err = migrated.Status("a", sampleTime)
 	if err != nil || status.Allowed || !status.Unlimited || status.Reason != "disabled" || !status.Account.StatsFault {
 		t.Fatalf("unlimited migration bypassed prior protection: %+v, %v", status, err)
+	}
+}
+
+func TestAdministratorReusesDefaultAccountAndHidesHash(t *testing.T) {
+	s, _ := testStore(t)
+	if err := s.CreateAccount("old-admin-ledger", "admin", 50); err != nil {
+		t.Fatal(err)
+	}
+	apply(t, s, "old-admin-ledger", "old-generation", map[string]int64{uplink: 60}, sampleTime)
+	if err := s.SetEnabled("old-admin-ledger", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFault("old-admin-ledger", true); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.CreateAdministrator("unused-new-ledger", "admin", "opaque-password-hash")
+	if err != nil || id != "old-admin-ledger" {
+		t.Fatalf("default admin did not reuse its account: %q, %v", id, err)
+	}
+	status, err := s.Status(id, sampleTime)
+	if err != nil || !status.Unlimited || status.Account.QuotaBytes != 50 || status.Account.Enabled || !status.Account.StatsFault || status.Usage.Upload != 60 || status.Allowed {
+		t.Fatalf("administrator creation changed account protection or ledger: %+v, %v", status, err)
+	}
+	admin, err := s.Administrator()
+	if err != nil || admin.ID != id || admin.Name != "admin" || admin.Hash != "opaque-password-hash" {
+		t.Fatalf("invalid administrator profile: %+v, %v", admin, err)
+	}
+	for _, value := range []any{admin, status} {
+		encoded, err := json.Marshal(value)
+		if err != nil || strings.Contains(string(encoded), "opaque-password-hash") || strings.Contains(string(encoded), "Hash") || strings.Contains(string(encoded), "password_hash") {
+			t.Fatalf("administrator hash was exposed in JSON: %q, %v", encoded, err)
+		}
+	}
+	if _, err := s.Account("unused-new-ledger"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("administrator reuse created another account: %v", err)
+	}
+	if _, err := s.CreateAdministrator("second-ledger", "other-admin", "other-hash"); !errors.Is(err, ErrAdministratorExists) {
+		t.Fatalf("multiple administrators were accepted: %v", err)
+	}
+	accounts, err := s.Accounts()
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("duplicate administrator changed accounts: %+v, %v", accounts, err)
+	}
+	if err := s.CreateAccount("normal-ledger", "normal", 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("INSERT INTO administrators(id, account_id, password_hash) VALUES (2, 'normal-ledger', 'hash')"); err == nil {
+		t.Fatal("schema permitted a second administrator slot")
+	}
+}
+
+func TestAdministratorRenameAndPasswordKeepAccountIdentity(t *testing.T) {
+	s, path := testStore(t)
+	id, err := s.CreateAdministrator("admin-ledger", "custom-admin", "hash-before")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, s, id, "original-process", map[string]int64{uplink: 100, downlink: 200}, sampleTime)
+	credential := []byte(`{"inbounds":[{"users":[{"password":"unchanged-protocol-secret"}]}]}`)
+	if _, err := s.DB.Exec("INSERT INTO nodes(id, name, template, legacy) VALUES ('old-node', 'old-node', ?, 1)", credential); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("INSERT INTO bindings(id, account_id, node_id, inbound) VALUES ('old-binding', ?, 'old-node', ?)", id, credential); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("INSERT INTO instances(account_id, stats_port, generation, process_id, config_hash) VALUES (?, 31111, 'original-process', 'original-pid', 'original-config-hash')", id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameAdministrator("renamed-admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAdministratorPassword("hash-after"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	admin, err := reopened.Administrator()
+	if err != nil || admin.ID != id || admin.Name != "renamed-admin" || admin.Hash != "hash-after" {
+		t.Fatalf("administrator changes did not persist with its ledger ID: %+v, %v", admin, err)
+	}
+	status, err := reopened.Status(id, sampleTime)
+	if err != nil || status.Account.Name != "renamed-admin" || !status.Unlimited || status.Usage.Upload != 100 || status.Usage.Download != 200 {
+		t.Fatalf("administrator changes modified account usage: %+v, %v", status, err)
+	}
+	var inbound, template []byte
+	if err := reopened.DB.QueryRow("SELECT inbound FROM bindings WHERE id = 'old-binding' AND account_id = ?", id).Scan(&inbound); err != nil || string(inbound) != string(credential) {
+		t.Fatalf("administrator changes modified protocol credentials: %q, %v", inbound, err)
+	}
+	if err := reopened.DB.QueryRow("SELECT template FROM nodes WHERE id = 'old-node'").Scan(&template); err != nil || string(template) != string(credential) {
+		t.Fatalf("administrator changes modified original node: %q, %v", template, err)
+	}
+	for query, wanted := range map[string]int{
+		"SELECT COUNT(*) FROM accounts WHERE id = 'admin-ledger' AND name = 'renamed-admin'":                                                                                            1,
+		"SELECT COUNT(*) FROM samples WHERE account_id = 'admin-ledger' AND generation = 'original-process'":                                                                            2,
+		"SELECT COUNT(*) FROM instances WHERE account_id = 'admin-ledger' AND generation = 'original-process' AND process_id = 'original-pid' AND config_hash = 'original-config-hash'": 1,
+	} {
+		var count int
+		if err := reopened.DB.QueryRow(query).Scan(&count); err != nil || count != wanted {
+			t.Fatalf("administrator changes modified account identity: %s: %d, %v", query, count, err)
+		}
+	}
+}
+
+func TestAdministratorValidationAndRenameConflictAreAtomic(t *testing.T) {
+	s, _ := testStore(t)
+	if _, err := s.Administrator(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("uninitialized administrator lookup succeeded: %v", err)
+	}
+	if err := s.SetAdministratorPassword("hash"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("password change created an administrator: %v", err)
+	}
+	if err := s.RenameAdministrator("name"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rename created an administrator: %v", err)
+	}
+	for _, fields := range [][3]string{{"", "admin", "hash"}, {"id", "  ", "hash"}, {"id", "admin", "\t "}} {
+		if _, err := s.CreateAdministrator(fields[0], fields[1], fields[2]); err == nil {
+			t.Fatal("empty administrator input was accepted")
+		}
+	}
+	id, err := s.CreateAdministrator("admin-ledger", "admin", "original-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAccount("other-ledger", "occupied-name", 123); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"occupied-name", " "} {
+		if err := s.RenameAdministrator(name); err == nil {
+			t.Fatal("conflicting or empty administrator name accepted")
+		}
+	}
+	if err := s.SetAdministratorPassword(" "); err == nil {
+		t.Fatal("empty password hash accepted")
+	}
+	admin, err := s.Administrator()
+	if err != nil || admin.ID != id || admin.Name != "admin" || admin.Hash != "original-hash" {
+		t.Fatalf("rejected changes modified administrator: %+v, %v", admin, err)
+	}
+	if _, err := s.DB.Exec("UPDATE administrators SET password_hash = '' WHERE id = 1"); err == nil {
+		t.Fatal("schema accepted an empty password hash")
+	}
+}
+
+func TestAdministratorCreationFailureRollsBackAccountChanges(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		name := "new-account"
+		if reuse {
+			name = "existing-account"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, _ := testStore(t)
+			if reuse {
+				if err := s.CreateAccount("old-ledger", "admin", 123); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.DB.Exec("CREATE TRIGGER reject_administrator BEFORE INSERT ON administrators BEGIN SELECT RAISE(ABORT, 'fixture administrator write failure'); END"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.CreateAdministrator("new-ledger", "admin", "hash"); err == nil {
+				t.Fatal("administrator write failure was not reported")
+			}
+			if _, err := s.Administrator(); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("failed creation left an administrator: %v", err)
+			}
+			accounts, err := s.Accounts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reuse {
+				if len(accounts) != 1 || accounts[0].ID != "old-ledger" || accounts[0].Unlimited || accounts[0].QuotaBytes != 123 {
+					t.Fatalf("failed role creation modified existing account: %+v", accounts)
+				}
+			} else if len(accounts) != 0 {
+				t.Fatalf("failed role creation left a new account: %+v", accounts)
+			}
+		})
+	}
+}
+
+func TestSchemaV2MigrationPreservesUnlimitedAccounts(t *testing.T) {
+	s, path := testStore(t)
+	if err := s.CreateUnlimitedAccount("old-admin", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	addAccount(t, s, "fixed", 256)
+	apply(t, s, "old-admin", "old-process", map[string]int64{uplink: 500}, sampleTime)
+	if err := s.SetEnabled("old-admin", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFault("old-admin", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("DROP TABLE administrators"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("PRAGMA user_version = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if _, err := migrated.Administrator(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("migration invented an administrator password: %v", err)
+	}
+	status, err := migrated.Status("old-admin", sampleTime)
+	if err != nil || !status.Unlimited || status.Account.Enabled || !status.Account.StatsFault || status.Usage.Upload != 500 || status.Allowed {
+		t.Fatalf("v2 migration modified unlimited account state: %+v, %v", status, err)
+	}
+	fixed, err := migrated.Account("fixed")
+	if err != nil || fixed.Unlimited || fixed.QuotaBytes != 256 {
+		t.Fatalf("v2 migration modified fixed quota: %+v, %v", fixed, err)
+	}
+	id, err := migrated.CreateAdministrator("unused-admin", "admin", "new-admin-hash")
+	if err != nil || id != "old-admin" {
+		t.Fatalf("v2 account was not reused for administrator: %q, %v", id, err)
+	}
+	var checkpoint int64
+	if err := migrated.DB.QueryRow("SELECT value FROM samples WHERE account_id = 'old-admin' AND generation = 'old-process'").Scan(&checkpoint); err != nil || checkpoint != 500 {
+		t.Fatalf("v2 migration changed counter checkpoint: %d, %v", checkpoint, err)
+	}
+}
+
+func TestConcurrentAdministratorCreationHasOneAccountAndRole(t *testing.T) {
+	s, path := testStore(t)
+	other, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	type creation struct {
+		ID  string
+		Err error
+	}
+	ready := make(chan struct{})
+	results := make(chan creation, 2)
+	for i, target := range []*Store{s, other} {
+		go func(index int, target *Store) {
+			<-ready
+			name := "first-admin"
+			if index == 1 {
+				name = "second-admin"
+			}
+			id, err := target.CreateAdministrator(name, name, "opaque-hash")
+			results <- creation{ID: id, Err: err}
+		}(i, target)
+	}
+	close(ready)
+	winner := ""
+	for range 2 {
+		result := <-results
+		if result.Err == nil {
+			if winner != "" {
+				t.Fatal("both concurrent administrator creations succeeded")
+			}
+			winner = result.ID
+		} else if !errors.Is(result.Err, ErrAdministratorExists) {
+			t.Fatalf("unexpected competing administrator error: %v", result.Err)
+		}
+	}
+	accounts, err := s.Accounts()
+	if err != nil || len(accounts) != 1 || accounts[0].ID != winner {
+		t.Fatalf("competing administrator left an extra account: %+v, %v", accounts, err)
+	}
+	admin, err := s.Administrator()
+	if err != nil || admin.ID != winner {
+		t.Fatalf("administrator role does not belong to the winning account: %+v, %v", admin, err)
 	}
 }

@@ -7,6 +7,10 @@ sbe_root() {
 sbe_help() {
     cat <<'HELP'
 sing-box Enhanced（本地管理，不依赖 Agent/API）
+  sb admin setup [--name admin] [--password-stdin]
+  sb admin show
+  sb admin rename --name NAME
+  sb admin passwd [--password-stdin]
   sb account create --name NAME --bytes MONTHLY_BYTES
   sb account create --name NAME --unlimited
   sb account list
@@ -38,6 +42,10 @@ node add 当前使用上游脚本生成的单入站 JSON 模板（如 conf/*.jso
 endpoints 含认证信息，仅供本机 root 查看。账号不是 Linux 系统用户。
 url/qr 显示单节点分享链接；qr 需要已安装 qrencode，不会自动安装。
 log 默认查看流量守护日志，--account 查看该账号实例日志。
+admin 是应用管理员（默认无限月额度），不是 Linux root 或协议认证凭据。
+管理员密码仅通过 --password-stdin 的标准输入提供，禁止作为命令参数传入。
+未提供密码时生成随机密码，仅保存在 root 可读的凭据文件，命令输出文件路径。
+admin setup 仅用于首次初始化；已有管理员时拒绝覆盖。当前不提供登录/API。
 账号订阅、Agent/API 和 Dashboard 不包含在本阶段。
 HELP
     if [[ ${SBE_DEVELOPER:-0} == 1 ]] && sbe_legacy_present; then
@@ -143,8 +151,37 @@ sbe_menu_share() {
     sbe_run node "$action" "${share_args[@]}"
 }
 
+sbe_menu_admin_password() {
+    local password confirmation result=1 tracing=0
+    if [[ $- == *x* ]]; then
+        tracing=1
+        set +x
+    fi
+    if IFS= read -r -s -p '新应用管理员密码（隐藏输入）：' password; then
+        printf '\n'
+        if IFS= read -r -s -p '再次输入密码：' confirmation; then
+            printf '\n'
+            if [[ -z $password ]]; then
+                printf '%s\n' '密码为空，未修改。' >&2
+            elif [[ $password != "$confirmation" ]]; then
+                printf '%s\n' '两次输入不一致，未修改。' >&2
+            else
+                printf '%s\n' "$password" | sbe_run admin passwd --password-stdin
+                result=$?
+            fi
+        else
+            printf '\n%s\n' '输入已取消，未修改密码。' >&2
+        fi
+    else
+        printf '\n%s\n' '输入已取消，未修改密码。' >&2
+    fi
+    unset password confirmation
+    [[ $tracing == 0 ]] || set -x
+    return "$result"
+}
+
 sbe_menu() {
-    local choice account domain acceptance
+    local choice account domain acceptance admin_name
     while true; do
         printf '\n%s\n' 'sing-box Enhanced' \
             '1. 应用账号列表' '2. 创建应用账号' '3. 启用账号' '4. 停用账号' \
@@ -154,7 +191,8 @@ sbe_menu() {
             '14. 安装 WARP' '15. 接受条款并注册 WARP' '16. 连接 WARP' '17. 断开 WARP' \
             '18. 受管服务状态' '19. 启动受管服务' '20. 停止全部受管账号' \
             '21. 重启受管服务' '22. 命令帮助' '23. 查看单节点分享链接' \
-            '24. 查看单节点二维码' '25. 查看流量守护日志' '0. 退出'
+            '24. 查看单节点二维码' '25. 查看流量守护日志' '26. 查看应用管理员' \
+            '27. 修改应用管理员名字' '28. 修改应用管理员密码' '0. 退出'
         if [[ ${SBE_DEVELOPER:-0} == 1 ]] && sbe_legacy_present; then
             printf '%s\n' '90. 检查原脚本迁移（只读）'
         fi
@@ -194,6 +232,9 @@ sbe_menu() {
         23) sbe_menu_share url ;;
         24) sbe_menu_share qr ;;
         25) sbe_run service log ;;
+        26) sbe_run admin show ;;
+        27) sbe_prompt admin_name '新的应用管理员名字：' && sbe_run admin rename --name "$admin_name" ;;
+        28) sbe_menu_admin_password ;;
         90)
             if [[ ${SBE_DEVELOPER:-0} == 1 ]] && sbe_legacy_present; then
                 sbe_run migrate inspect
@@ -213,7 +254,7 @@ sbe_dispatch() {
     local command=${1:-} root core
     root=$(sbe_root)
     case $command in
-    account | node | warp)
+    admin | account | node | warp)
         sbe_run "$@" || exit "$?"
         return 0
         ;;

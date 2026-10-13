@@ -16,12 +16,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 var (
-	ErrClockRollback = errors.New("accounting period moved backwards")
-	ErrInvalidSample = errors.New("invalid traffic sample")
-	beijing          = time.FixedZone("Asia/Shanghai", 8*60*60)
+	ErrClockRollback       = errors.New("accounting period moved backwards")
+	ErrInvalidSample       = errors.New("invalid traffic sample")
+	ErrAdministratorExists = errors.New("administrator already exists")
+	beijing                = time.FixedZone("Asia/Shanghai", 8*60*60)
 )
 
 type Store struct {
@@ -50,6 +51,14 @@ type AccountStatus struct {
 	Allowed   bool
 	Reason    string
 	Unlimited bool
+}
+
+// Administrator.ID is the associated account's stable ledger ID. Its name is
+// read from accounts and its password hash is never included in JSON output.
+type Administrator struct {
+	ID   string
+	Name string
+	Hash string `json:"-"`
 }
 
 // Period identifies a calendar month in Beijing time, independently of host TZ.
@@ -144,8 +153,13 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate account schema from version 1: %w", err)
 		}
 	}
+	if version == 1 || version == 2 {
+		if _, err := tx.Exec(administratorSchema); err != nil {
+			return fmt.Errorf("migrate administrator schema: %w", err)
+		}
+	}
 	if version < schemaVersion {
-		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+		if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
 			return err
 		}
 	}
@@ -204,6 +218,13 @@ CREATE TABLE operations (
     id INTEGER PRIMARY KEY,
     event TEXT NOT NULL,
     created_at TEXT NOT NULL
+);` + administratorSchema
+
+const administratorSchema = `
+CREATE TABLE administrators (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+    password_hash TEXT NOT NULL CHECK (length(password_hash) > 0)
 );`
 
 func (s *Store) CreateAccount(id, name string, quota int64) error {
@@ -232,6 +253,112 @@ func (s *Store) createAccount(id, name string, quota int64, unlimited bool) erro
 		return err
 	}
 	if err := record(tx, "account_created:"+id, time.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CreateAdministrator creates the sole application administrator atomically.
+// A matching account name reuses its ledger ID and all existing state, with
+// only the Unlimited flag enabled. Password hashing belongs to the caller.
+func (s *Store) CreateAdministrator(id, name, hash string) (string, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(hash) == "" {
+		return "", errors.New("administrator id, name and password hash are required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var existing string
+	err = tx.QueryRow("SELECT account_id FROM administrators WHERE id = 1").Scan(&existing)
+	if err == nil {
+		return "", ErrAdministratorExists
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	var accountID string
+	err = tx.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&accountID)
+	switch {
+	case err == nil:
+		if _, err := tx.Exec("UPDATE accounts SET unlimited = 1 WHERE id = ?", accountID); err != nil {
+			return "", err
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		accountID = id
+		if _, err := tx.Exec("INSERT INTO accounts(id, name, quota_bytes, unlimited) VALUES (?, ?, 0, 1)", id, name); err != nil {
+			return "", err
+		}
+		if err := record(tx, "account_created:"+id, time.Now()); err != nil {
+			return "", err
+		}
+	default:
+		return "", err
+	}
+	if _, err := tx.Exec("INSERT INTO administrators(id, account_id, password_hash) VALUES (1, ?, ?)", accountID, hash); err != nil {
+		return "", err
+	}
+	if err := record(tx, "administrator_created:"+accountID, time.Now()); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return accountID, nil
+}
+
+func (s *Store) Administrator() (Administrator, error) {
+	var a Administrator
+	err := s.DB.QueryRow(`SELECT accounts.id, accounts.name, administrators.password_hash
+        FROM administrators JOIN accounts ON accounts.id = administrators.account_id
+        WHERE administrators.id = 1`).Scan(&a.ID, &a.Name, &a.Hash)
+	return a, err
+}
+
+func (s *Store) SetAdministratorPassword(hash string) error {
+	if strings.TrimSpace(hash) == "" {
+		return errors.New("administrator password hash is required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec("UPDATE administrators SET password_hash = ? WHERE id = 1", hash)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	if err := record(tx, "administrator_password_changed", time.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RenameAdministrator(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("administrator name is required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id string
+	if err := tx.QueryRow("SELECT account_id FROM administrators WHERE id = 1").Scan(&id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE accounts SET name = ? WHERE id = ?", name, id); err != nil {
+		return err
+	}
+	if err := record(tx, "administrator_renamed:"+id, time.Now()); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -7,6 +7,7 @@
 | 检查 | 结果与范围 |
 | --- | --- |
 | Go全包测试、go vet | 通过 |
+| 应用管理员 | Argon2id固定成本、随机盐、恶意PHC拒绝、stdin输入、凭据0600、JSON/审计不泄露均通过；v1/v2到v3保留账本/绑定，改名及密码轮换不调用systemd |
 | Bash分派、危险旧路径拦截、root安装防覆盖 | 通过；本机与服务器rootfixture |
 | SOCKS / VMess / VLESS / Trojan / SS / TUIC / Hysteria2 / AnyTLS | 8类实际HTTP上传下载均通过；每次上行196840、下行327896字节 |
 | 15个上游传输/REALITY变体 | 均通过后端实际转发、入站计量；HTTPUpgrade三项修正测试客户端Host字段后复测通过 |
