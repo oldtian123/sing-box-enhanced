@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Enhanced installs use local, already-built artifacts and never enter the
+# upstream dependency downloader or generate an unowned default node.
+if [[ ${1:-} == --enhanced ]]; then
+    shift
+    _sbe_install_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec bash "$_sbe_install_root/scripts/install-enhanced.sh" "$@"
+fi
+
 author=233boy
 # github=https://github.com/233boy/sing-box
 
@@ -70,7 +78,7 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=${SBE_REPO:-oldtian123/sing-box-enhanced}
 is_pkg="wget tar bash"
 # Alpine: gcompat provides glibc compatibility for prebuilt binaries
 [[ $cmd =~ apk ]] && is_pkg="$is_pkg gcompat jq"
@@ -132,6 +140,7 @@ show_help() {
     echo -e "  -p, --proxy <addr>              使用代理下载, e.g., -p http://127.0.0.1:2333"
     echo -e "  -v, --core-version <ver>        自定义 $is_core_name 版本, e.g., -v v1.8.13"
     echo -e "  -h, --help                      显示此帮助界面\n"
+    echo -e "  --enhanced --core <path> --helper <path>  使用本地产物安装增强版（详见 scripts/install-enhanced.sh --help）\n"
 
     exit 0
 }
