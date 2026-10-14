@@ -101,6 +101,9 @@ func Run(args []string, out io.Writer) error {
 	if args[0] == "admin" {
 		return runAdmin(o, args[1:], out, os.Stdin)
 	}
+	if args[0] == "view" {
+		return runView(o, args[1:], out)
+	}
 	if len(args) >= 2 && args[0] == "warp" {
 		switch args[1] {
 		case "register":
@@ -173,7 +176,10 @@ func (a *App) resolve(table, key string) (string, error) {
 		return "", errors.New("invalid lookup")
 	}
 	var id string
-	err := a.DB.DB.QueryRow("SELECT id FROM "+table+" WHERE id=? OR name=?", key, key).Scan(&id)
+	err := a.DB.DB.QueryRow("SELECT id FROM "+table+" WHERE id=?", key).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = a.DB.DB.QueryRow("SELECT id FROM "+table+" WHERE name=?", key).Scan(&id)
+	}
 	return id, err
 }
 func (a *App) dispatch(args []string) error {

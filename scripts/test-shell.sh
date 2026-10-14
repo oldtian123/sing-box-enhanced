@@ -24,6 +24,44 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
     esac
 done
+if [[ ${SBE_TEST_FAIL_COMMAND:-} == "${1:-} ${2:-}" ]]; then
+    printf '%s\n' '{"error":"fixture failure"}' >&2
+    exit 7
+fi
+if [[ ${1:-} == view ]]; then
+    operation=${2:-}; shift 2
+    case $operation in
+    choices)
+        kind=
+        while [[ $# -gt 0 ]]; do
+            case $1 in --kind) kind=$2; shift 2;; *) shift;; esac
+        done
+        case $kind in
+        node) printf 'node-stable-1\t旧 Hysteria2\t运行中\nnode-stable-2\t第二节点\t已停止\n' ;;
+        account)
+            printf 'account-stable-1\t普通账号\t允许访问\n'
+            [[ ${SBE_TEST_SINGLE_BINDING:-0} == 1 ]] || printf 'account-stable-2\t备用账号\t手动停用\n'
+            ;;
+        domain) printf 'example.com\texample.com\t走 WARP\n' ;;
+        esac
+        ;;
+    quota-bytes)
+        if [[ ${2:-} =~ ^[0-9]+$ ]]; then printf '%s\n' "$((10#${2:-0} * 1000000000))"
+        elif [[ ${2:-} == 0.5 ]]; then printf '%s\n' 500000000
+        else exit 1; fi
+        ;;
+    node) printf '%s\n' '节点名称：旧 Hysteria2' '认证凭据：已隐藏' ;;
+    account) printf '%s\n' '账号名称：普通账号' '当月已用：1 GB' '账号状态：手动停用' ;;
+    endpoint) printf '%s\n' '协议：Hysteria2' '协议密码：fixture-protocol-password' ;;
+    url) printf '%s\n' 'hysteria2://fixture-private-link' ;;
+    qr) printf '%s\n' 'fixture-QR' ;;
+    admin) printf '%s\n' '管理员名称：admin' '登录密码：已隐藏' ;;
+    services) printf '%s\n' '流量计量服务：运行中' ;;
+    warp) printf '%s\n' 'WARP 客户端：已安装' ;;
+    rules) printf '%s\n' '匹配方式：精确域名匹配' ;;
+    esac
+    exit 0
+fi
 if [[ ${1:-} == admin ]]; then
     operation=${2:-}
     case $operation in
@@ -52,6 +90,7 @@ if [[ ${1:-} == admin ]]; then
         printf 'Initial credentials: %s\n' "$helper_root/admin.initial-credentials.json"
     fi
 fi
+printf '%s\n' '{"result":"business-json"}'
 exit "${SBE_TEST_EXIT:-0}"
 HELPER
 chmod +x "$fixture/helper"
@@ -91,71 +130,138 @@ bash "$repo/sing-box.sh" log --account 'name with spaces' --tail 12
 bash "$repo/sing-box.sh" service log --tail 12
 [[ $(cat "$fixture/call") == *$'<service>\n<log>\n<--tail>\n<12>' ]]
 
-run_menu 2 'menu name' unlimited 0
-[[ $(cat "$fixture/call") == *$'<account>\n<create>\n<--name>\n<menu name>\n<--unlimited>' ]]
-run_menu 5 'menu name' 无限 0
-[[ $(cat "$fixture/call") == *$'<account>\n<quota>\n<--id>\n<menu name>\n<--unlimited>' ]]
-run_menu 5 'menu name' 0 0
-[[ $(cat "$fixture/call") == *$'<account>\n<quota>\n<--id>\n<menu name>\n<--bytes>\n<0>' ]]
-rm -f "$fixture/call"
-run_menu 2 'menu name' invalid 0
-[[ ! -e $fixture/call ]]
-printf -v literal 'name; $(touch "%s/sentinel")' "$fixture"
-run_menu 2 "$literal" 1000 0
-[[ $(cat "$fixture/call") == *"<$literal>"* && ! -e $fixture/sentinel ]]
-for item in '3 enable' '4 disable' '6 reset'; do
+# Nested pages remain in the chosen module, use stable IDs, and never print
+# mutation JSON or credentials before an explicit detail action.
+rm -f "$fixture/history"
+run_menu 1 1 0 0 0
+[[ $(cat "$fixture/history") == *$'<view>\n<node>\n<--node>\n<node-stable-1>'* ]]
+[[ $(cat "$fixture/menu") != *'business-json'* && $(cat "$fixture/menu") != *'fixture-protocol-password'* ]]
+[[ $(LC_ALL=C awk '/sing-box Enhanced > 主菜单/{n++}END{print n+0}' "$fixture/menu") == 2 ]]
+[[ $(LC_ALL=C awk '/sing-box Enhanced > 查询节点/{n++}END{print n+0}' "$fixture/menu") == 3 ]]
+rm -f "$fixture/history"
+run_menu 1 1 1 2 '' 0 0 0
+[[ $(cat "$fixture/history") == *$'<view>\n<endpoint>\n<--node>\n<node-stable-1>\n<--account>\n<account-stable-2>'* ]]
+[[ $(cat "$fixture/menu") == *'fixture-protocol-password'* ]]
+# A single bound account goes straight to its endpoint; no extra account prompt.
+rm -f "$fixture/history"
+export SBE_TEST_SINGLE_BINDING=1
+run_menu 1 1 1 '' 0 0 0
+unset SBE_TEST_SINGLE_BINDING
+[[ $(cat "$fixture/history") == *$'<view>\n<endpoint>\n<--node>\n<node-stable-1>\n<--account>\n<account-stable-1>'* ]]
+[[ $(cat "$fixture/menu") != *'sing-box Enhanced > 查询节点 > 旧 Hysteria2 > 选择已绑定账号'* ]]
+for item in '2 url' '3 qr'; do
     read -r choice operation <<<"$item"
-    run_menu "$choice" 'menu name' 0
-    [[ $(cat "$fixture/call") == *"<account>"$'\n'"<$operation>"$'\n<--id>\n<menu name>' ]]
+    rm -f "$fixture/history"
+    run_menu 1 2 "$choice" 1 '[::1]:443' '' 0 0 0
+    [[ $(cat "$fixture/history") == *"<view>"$'\n'"<$operation>"$'\n<--node>\n<node-stable-2>\n<--account>\n<account-stable-1>\n<--server>\n<[::1]:443>'* ]]
 done
+rm -f "$fixture/history"
+run_menu 2 3 'menu name' 1 300 1 '' 0 0
+[[ $(cat "$fixture/history") == *$'<account>\n<create>\n<--name>\n<menu name>\n<--bytes>\n<300000000000>'* ]]
+[[ $(cat "$fixture/menu") != *'business-json'* ]]
+for amount in 0 0.5; do
+    rm -f "$fixture/history"
+    run_menu 2 1 3 1 "$amount" 1 '' 0 0 0
+    [[ $(cat "$fixture/history") == *$'<account>\n<quota>\n<--id>\n<account-stable-1>\n<--bytes>'* ]]
+    [[ $amount != 0 || $(cat "$fixture/history") == *$'<--bytes>\n<0>'* ]]
+    [[ $amount != 0.5 || $(cat "$fixture/history") == *$'<--bytes>\n<500000000>'* ]]
+done
+rm -f "$fixture/history"
+run_menu 2 1 3 2 1 '' 0 0 0
+[[ $(cat "$fixture/history") == *$'<account>\n<quota>\n<--id>\n<account-stable-1>\n<--unlimited>'* ]]
+for item in '1 enable' '2 disable' '4 reset' '5 recover'; do
+    read -r choice operation <<<"$item"
+    rm -f "$fixture/history"
+    run_menu 2 1 "$choice" 1 '' 0 0 0
+    [[ $(cat "$fixture/history") == *"<account>"$'\n'"<$operation>"$'\n<--id>\n<account-stable-1>'* ]]
+done
+[[ $(cat "$fixture/menu") == *'计量故障恢复操作已完成'* ]]
+run_menu 2 1 4 1 '' 0 0 0
+[[ $(cat "$fixture/menu") == *'手动停用和计量故障不会因此解除'* ]]
+# Blank input and unconfirmed actions must not mutate anything.
+for inputs in '2 1 2 0 0 0 0' '5 2 0 0 0'; do
+    rm -f "$fixture/history"
+    read -r -a sequence <<<"$inputs"
+    run_menu "${sequence[@]}"
+    [[ $(cat "$fixture/history") != *$'<account>\n<disable>'* && $(cat "$fixture/history") != *$'<service>\n<stop>'* ]]
+done
+rm -f "$fixture/history"
+run_menu 2 1 3 1 '' 0 0 0
+[[ $(cat "$fixture/history") != *$'<account>\n<quota>'* ]]
+rm -f "$fixture/history"
+run_menu 2 3 invalid-amount 1 not-a-number 0 0 0
+[[ $(cat "$fixture/history") != *$'<account>\n<create>'* ]]
+# No evaluation of user-supplied account names.
+printf -v literal 'name; $(touch "%s/sentinel")' "$fixture"
+rm -f "$fixture/history"
+run_menu 2 3 "$literal" 2 1 '' 0 0
+[[ $(cat "$fixture/history") == *"<$literal>"* && ! -e $fixture/sentinel ]]
+# Failed mutations stay on their page and do not announce success or expose JSON.
+rm -f "$fixture/history"
+export SBE_TEST_FAIL_COMMAND='account disable'
+run_menu 2 1 2 1 '' 0 0 0
+unset SBE_TEST_FAIL_COMMAND
+[[ $(cat "$fixture/menu") == *'操作未完成'* && $(cat "$fixture/menu") != *'账号已停用。'* && $(cat "$fixture/menu") != *'fixture failure'* ]]
+[[ $(LC_ALL=C awk '/账号与流量 > 普通账号/{n++}END{print n+0}' "$fixture/menu") == 2 ]]
+# Node import and binding keep filenames literal and select existing account IDs.
 printf '{}\n' >"$fixture/template with spaces.json"
 rm -f "$fixture/history"
-run_menu 8 'node with spaces' "$fixture/template with spaces.json" 'menu name' 12345 0
+run_menu 3 1 'node with spaces' "$fixture/template with spaces.json" 2 12345 1 '' 0 0
 [[ $(cat "$fixture/history") == *$'<node>\n<add>\n<--name>\n<node with spaces>\n<--template>'$'\n'"<$fixture/template with spaces.json>"* ]]
-[[ $(cat "$fixture/call") == *$'<node>\n<bind>\n<--node>\n<node with spaces>\n<--account>\n<menu name>\n<--port>\n<12345>' ]]
-rm -f "$fixture/call"
-run_menu 8 'node with spaces' "$fixture/template with spaces.json" 'menu name' 65536 0
-[[ ! -e $fixture/call ]]
-run_menu 15 no 0
-[[ ! -e $fixture/call ]]
-run_menu 15 ACCEPT 0
-[[ $(cat "$fixture/call") == *$'<warp>\n<register>\n<--accept-terms>' ]]
-for item in '12 add' '13 remove'; do
+[[ $(cat "$fixture/history") == *$'<node>\n<bind>\n<--node>\n<node with spaces>\n<--account>\n<account-stable-2>\n<--port>\n<12345>'* ]]
+rm -f "$fixture/history"
+run_menu 3 1 node "$fixture/template with spaces.json" 1 65536 '' 0 0
+[[ $(cat "$fixture/history") != *$'<node>\n<add>'* ]]
+# WARP rules are selected by number, and accepting terms is always explicit.
+rm -f "$fixture/history"
+run_menu 4 5 no 0 0
+[[ ! -e $fixture/history ]]
+run_menu 4 5 ACCEPT '' 0 0
+[[ $(cat "$fixture/history") == *$'<warp>\n<register>\n<--accept-terms>'* ]]
+rm -f "$fixture/history"
+run_menu 4 2 1 1 1 '' 0 0 0
+[[ $(cat "$fixture/history") == *$'<warp>\n<remove>\n<--domain>\n<example.com>'* ]]
+export SBE_TEST_FAIL_COMMAND='warp remove'
+run_menu 4 2 1 1 1 '' 0 0 0 0
+unset SBE_TEST_FAIL_COMMAND
+[[ $(LC_ALL=C awk '/WARP 管理 > 域名规则 > example.com/{n++}END{print n+0}' "$fixture/menu") == 2 ]]
+[[ $(cat "$fixture/menu") == *'操作未完成'* && $(cat "$fixture/menu") != *'WARP 域名规则已删除。'* ]]
+run_menu 4 3 example.org 1 '' 0 0
+[[ $(cat "$fixture/history") == *$'<warp>\n<add>\n<--domain>\n<example.org>'* ]]
+for item in '4 install' '6 connect' '7 disconnect'; do
     read -r choice operation <<<"$item"
-    run_menu "$choice" example.com 0
-    [[ $(cat "$fixture/call") == *"<warp>"$'\n'"<$operation>"$'\n<--domain>\n<example.com>' ]]
+    run_menu 4 "$choice" 1 '' 0 0
+    [[ $(cat "$fixture/history") == *"<warp>"$'\n'"<$operation>"* ]]
 done
-for item in '14 install' '16 connect' '17 disconnect'; do
-    read -r choice operation <<<"$item"
-    run_menu "$choice" 0
-    [[ $(cat "$fixture/call") == *"<warp>"$'\n'"<$operation>" ]]
-done
-run_menu 23 'menu name' '[::1]:443' 'node with spaces' 0
-[[ $(cat "$fixture/call") == *$'<node>\n<url>\n<--account>\n<menu name>\n<--server>\n<[::1]:443>\n<--node>\n<node with spaces>' ]]
-run_menu 24 'menu name' localhost '' 0
-[[ $(cat "$fixture/call") == *$'<node>\n<qr>\n<--account>\n<menu name>\n<--server>\n<localhost>' ]]
-run_menu 25 0
-[[ $(cat "$fixture/call") == *$'<service>\n<log>' ]]
-run_menu 26 0
-[[ $(cat "$fixture/call") == *$'<admin>\n<show>' ]]
-run_menu 27 'admin name with spaces' 0
-[[ $(cat "$fixture/call") == *$'<admin>\n<rename>\n<--name>\n<admin name with spaces>' ]]
+run_menu 6 1 '' 0 0
+[[ $(cat "$fixture/history") == *$'<service>\n<log>\n<--tail>\n<50>'* ]]
+run_menu 7 1 'admin name with spaces' 1 '' 0 0
+[[ $(cat "$fixture/history") == *$'<admin>\n<rename>\n<--name>\n<admin name with spaces>'* ]]
 password='fixture-password; $(touch ignored)'
-run_menu 28 "$password" "$password" 0
-[[ $(cat "$fixture/call") == *$'<admin>\n<passwd>\n<--password-stdin>' ]]
+run_menu 7 2 "$password" "$password" '' 0 0
+[[ $(cat "$fixture/history") == *$'<admin>\n<passwd>\n<--password-stdin>'* ]]
 [[ $(cat "$fixture/stdin") == "$password" ]]
 [[ $(cat "$fixture/call") != *"$password"* && $(cat "$fixture/menu") != *"$password"* ]]
-rm -f "$fixture/call" "$fixture/stdin"
-run_menu 28 first different 0
-[[ ! -e $fixture/call && ! -e $fixture/stdin ]]
-run_menu 28 '' '' 0
-[[ ! -e $fixture/call && ! -e $fixture/stdin ]]
+rm -f "$fixture/history" "$fixture/stdin"
+run_menu 7 2 first different '' 0 0
+[[ $(cat "$fixture/history") != *$'<admin>\n<passwd>'* && ! -e $fixture/stdin ]]
+run_menu 7 2 '' '' 0 0
+[[ $(cat "$fixture/history") != *$'<admin>\n<passwd>'* && ! -e $fixture/stdin ]]
 printf '%s\n' "$password" | bash "$repo/sing-box.sh" admin passwd --password-stdin >/dev/null
 [[ $(cat "$fixture/stdin") == "$password" ]]
 [[ $(cat "$fixture/call") == *$'<admin>\n<passwd>\n<--password-stdin>' && $(cat "$fixture/call") != *"$password"* ]]
 rm -f "$fixture/stdin"
-printf '%s\n' 28 "$password" "$password" 0 | bash -x "$repo/sing-box.sh" >"$fixture/traced-menu" 2>&1
+printf '%s\n' 7 2 "$password" "$password" '' 0 0 | bash -x "$repo/sing-box.sh" >"$fixture/traced-menu" 2>&1
 [[ $(cat "$fixture/traced-menu") != *"$password"* ]]
+# EOF at any depth exits instead of repeatedly repainting menus.
+for sequence in '' 1 '1 1' '2 1 3' '4 2 1' '7 2'; do
+    read -r -a items <<<"$sequence"
+    if [[ -n $sequence ]]; then run_menu "${items[@]}"; else run_menu; fi
+    [[ $(wc -l <"$fixture/menu") -lt 200 ]]
+done
+# Direct CLI commands keep the original business JSON contract.
+bash "$repo/sing-box.sh" account list >"$fixture/direct-json"
+[[ $(cat "$fixture/direct-json") == '{"result":"business-json"}' ]]
 
 for blocked in add change del passwd test run bin update uninstall dns import fix-all main-extra; do
     rm -f "$fixture/call"
@@ -255,4 +361,4 @@ else
     fi
     [[ ! -e $fixture/installed ]]
 fi
-printf '%s\n' 'PASS：参数保留、配额/只读别名、旧写路径拦截、安全交互菜单、管理员密码 stdin/隐藏输入、显式 WARP 条款、迁移门禁、错误码及安装保护'
+printf '%s\n' 'PASS：命令行 JSON 兼容、分层中文菜单、稳定 ID 选择、GB/零额度、多层返回/EOF、危险确认、错误停留、管理员密码隐藏、WARP 条款、迁移门禁与安装保护'
