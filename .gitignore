@@ -1,0 +1,8 @@
+/build/
+*.db
+*.db-shm
+*.db-wal
+*.lock
+*.test
+/.local/
+__pycache__/

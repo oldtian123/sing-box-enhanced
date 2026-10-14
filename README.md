@@ -1,3 +1,9 @@
+# 233Boy sing-box Enhanced
+
+基于 233Boy 原脚本的增强开发版：本地 Go 管理应用管理员、账号、自然月配额、进程隔离和固定域名 WARP 分流。
+安装、使用方式及验证边界见 [第一阶段说明](docs/phase1.md)。原脚本说明保留在下方。
+无参数 `sb` 提供[分层中文交互菜单](docs/interactive-menu.md)，带参数命令保留JSON输出。
+
 # 介绍
 
 最好用的 sing-box 一键安装脚本 & 管理脚本
