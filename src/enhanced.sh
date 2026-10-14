@@ -233,9 +233,78 @@ sbe_quota_input() {
     return 1
 }
 
+# Detect only an IPv4 address actually assigned to this host. Never ask an
+# external IP service: its answer could be a WARP/proxy egress address.
+sbe_public_ipv4() {
+    local a b c d octet
+    [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; c=${BASH_REMATCH[3]}; d=${BASH_REMATCH[4]}
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ ! $octet =~ ^0[0-9] ]] && (( 10#$octet <= 255 )) || return 1
+    done
+    (( a > 0 && a < 224 && a != 10 && a != 127 )) || return 1
+    (( a != 100 || b < 64 || b > 127 )) || return 1
+    (( a != 169 || b != 254 )) || return 1
+    (( a != 172 || b < 16 || b > 31 )) || return 1
+    (( a != 192 || (b != 168 && !(b == 0 && (c == 0 || c == 2)) && !(b == 88 && c == 99)) )) || return 1
+    (( a != 198 || (b != 18 && b != 19 && !(b == 51 && c == 100)) )) || return 1
+    (( a != 203 || b != 0 || c != 113 ))
+}
+
+sbe_server_interface() {
+    local interface=$1 link
+    case $interface in
+    ''|lo|lo[0-9]*|tun*|tap*|wg*|warp*|docker*|veth*|tailscale*|br*|virbr*|vpn*|ppp*|sit*|gre*|ip6tnl*|dummy*|ifb*|zt*|vmnet*|vboxnet*) return 1 ;;
+    esac
+    link=$(ip -d link show dev "$interface" 2>/dev/null) || return 1
+    [[ -n $link ]] || return 1
+    [[ ! $link =~ [[:space:]](wireguard|tun|tap|veth|vxlan|geneve|gre|gretap|ip6gre|ip6gretap|ipip|sit|ip6tnl|dummy|loopback)([[:space:]]|$) ]]
+}
+
+sbe_local_server_ipv4() {
+    local candidate=$1 addresses=$2 expected=${3:-} index interface family address rest
+    sbe_public_ipv4 "$candidate" || return 1
+    while read -r index interface family address rest; do
+        interface=${interface%%@*}
+        [[ $family == inet && ${address%/*} == "$candidate" ]] || continue
+        [[ -z $expected || $interface == "$expected" ]] || continue
+        sbe_server_interface "$interface" && return 0
+    done <<<"$addresses"
+    return 1
+}
+
+sbe_default_server() {
+    local addresses client client_port server server_port route interface= source= index
+    local -a fields=()
+    addresses=$(ip -o -4 addr show scope global 2>/dev/null) || return 1
+    read -r client client_port server server_port <<<"${SSH_CONNECTION:-}"
+    if [[ -n $server ]] && sbe_local_server_ipv4 "$server" "$addresses"; then
+        printf '%s\n' "$server"
+        return 0
+    fi
+    route=$(ip -4 route get 1.1.1.1 2>/dev/null) || return 1
+    read -r -a fields <<<"$route"
+    for ((index=0; index<${#fields[@]}; index++)); do
+        case ${fields[index]} in
+        dev) interface=${fields[index+1]:-} ;;
+        src) source=${fields[index+1]:-} ;;
+        esac
+    done
+    [[ -n $interface && -n $source ]] || return 1
+    sbe_local_server_ipv4 "$source" "$addresses" "$interface" || return 1
+    printf '%s\n' "$source"
+}
+
 sbe_menu_share() {
-    local action=$1 node=$2 account=$3 server
-    sbe_prompt server '客户端使用的服务器地址（HOST 或 HOST:PORT，留空取消）：' || return
+    local action=$1 node=$2 account=$3 server default
+    default=$(sbe_default_server) || default=
+    if [[ -n $default ]]; then
+        sbe_prompt server "服务器地址 [$default]（回车使用，或输入域名/HOST:PORT）：" optional || return
+        [[ -n $server ]] || server=$default
+    else
+        printf '%s\n' '未能确认本机公网 IPv4，请手动填写服务器地址（IPv6 使用 [地址]:端口）。'
+        sbe_prompt server '服务器地址（域名、IPv4 或 HOST:PORT，留空取消）：' || return
+    fi
     printf '%s\n' '以下内容包含此账号的协议认证信息，请妥善保存。'
     sbe_view "$action" --node "$node" --account "$account" --server "$server"
     sbe_pause

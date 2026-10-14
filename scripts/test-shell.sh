@@ -99,6 +99,27 @@ export SBE_TEST_LOG="$fixture/call" SBE_UNIT_DIR="$fixture/units"
 export SBE_TEST_HISTORY="$fixture/history"
 export SBE_TEST_STDIN_LOG="$fixture/stdin"
 
+# Mock all address and route reads; tests never depend on this host's network.
+mkdir -p "$fixture/bin"
+cat >"$fixture/bin/ip" <<'IP'
+#!/bin/bash
+case "$*" in
+'-o -4 addr show scope global')
+    [[ -n ${SBE_TEST_IP_ADDR:-} ]] || exit 1
+    printf '%s\n' "$SBE_TEST_IP_ADDR"
+    ;;
+'-4 route get 1.1.1.1')
+    [[ -n ${SBE_TEST_IP_ROUTE:-} ]] || exit 1
+    printf '%s\n' "$SBE_TEST_IP_ROUTE"
+    ;;
+'-d link show dev '*) printf '%s\n' "${SBE_TEST_IP_LINK:-2: eth0: <BROADCAST,UP> link/ether 00:00:00:00:00:00}" ;;
+*) exit 1 ;;
+esac
+IP
+chmod +x "$fixture/bin/ip"
+export PATH="$fixture/bin:$PATH"
+export SSH_CONNECTION=
+
 run_menu() {
     printf '%s\n' "$@" | bash "$repo/sing-box.sh" >"$fixture/menu" 2>&1
 }
@@ -155,6 +176,71 @@ for item in '2 url' '3 qr'; do
     run_menu 1 2 "$choice" 1 '[::1]:443' '' 0 0 0
     [[ $(cat "$fixture/history") == *"<view>"$'\n'"<$operation>"$'\n<--node>\n<node-stable-2>\n<--account>\n<account-stable-1>\n<--server>\n<[::1]:443>'* ]]
 done
+# Share defaults come from an assigned public server address, never an HTTP
+# egress check. Empty input uses that address for both URL and QR.
+export SBE_TEST_IP_ADDR='2: eth0 inet 93.184.216.34/24 scope global eth0'
+export SBE_TEST_IP_ROUTE='1.1.1.1 via 93.184.216.1 dev eth0 src 93.184.216.34 uid 0'
+for item in '2 url' '3 qr'; do
+    read -r choice operation <<<"$item"
+    rm -f "$fixture/history"
+    run_menu 1 1 "$choice" 1 '' '' 0 0 0
+    [[ $(cat "$fixture/history") == *"<$operation>"$'\n<--node>\n<node-stable-1>\n<--account>\n<account-stable-1>\n<--server>\n<93.184.216.34>'* ]]
+done
+# The confirmed SSH destination wins over a different route source.
+export SBE_TEST_IP_ADDR=$'2: eth0 inet 93.184.216.34/24 scope global eth0\n3: ens2 inet 8.8.4.4/24 scope global ens2'
+export SSH_CONNECTION='10.0.0.2 12345 8.8.4.4 22'
+run_menu 1 1 2 1 '' '' 0 0 0
+[[ $(cat "$fixture/history") == *$'<--server>\n<8.8.4.4>'* ]]
+for explicit in '[2001:db8::1]:443' 'node.example.com:8443'; do
+    run_menu 1 1 2 1 "$explicit" '' 0 0 0
+    [[ $(cat "$fixture/history") == *$'<--server>\n'"<$explicit>"* ]]
+done
+# EOF at the address prompt must not invoke URL rendering even with a default.
+rm -f "$fixture/history"
+printf '%s\n' 1 1 2 1 | bash "$repo/sing-box.sh" >"$fixture/menu" 2>&1
+[[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+export SSH_CONNECTION=
+# Private, CGNAT, reserved, invalid and tunnel addresses cannot become defaults.
+for rejected in 0.0.0.0 10.1.2.3 127.0.0.1 169.254.1.2 172.16.2.3 192.168.1.2 100.64.0.1 192.0.2.1 198.18.0.1 198.51.100.1 203.0.113.1 224.0.0.1 240.0.0.1 256.1.2.3 01.2.3.4; do
+    export SBE_TEST_IP_ADDR="2: eth0 inet $rejected/24 scope global eth0"
+    export SBE_TEST_IP_ROUTE="1.1.1.1 dev eth0 src $rejected uid 0"
+    export SSH_CONNECTION="10.0.0.2 12345 $rejected 22"
+    rm -f "$fixture/history"
+    run_menu 1 1 2 1 '' 0 0 0
+    [[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+    [[ $(cat "$fixture/menu") == *'未能确认本机公网 IPv4'* ]]
+done
+export SSH_CONNECTION=
+for interface in lo tun0 tap0 wg0 warp0 docker0 veth123 tailscale0; do
+    export SBE_TEST_IP_ADDR="2: $interface inet 93.184.216.34/24 scope global $interface"
+    export SBE_TEST_IP_ROUTE="1.1.1.1 dev $interface src 93.184.216.34 uid 0"
+    rm -f "$fixture/history"
+    run_menu 1 1 2 1 '' 0 0 0
+    [[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+done
+# A tunnel with an ordinary name is rejected by its link type as well.
+export SBE_TEST_IP_ADDR='2: eth0 inet 93.184.216.34/24 scope global eth0'
+export SBE_TEST_IP_ROUTE='1.1.1.1 dev eth0 src 93.184.216.34 uid 0'
+export SBE_TEST_IP_LINK=$'2: eth0: <UP>\n    wireguard'
+rm -f "$fixture/history"
+run_menu 1 1 2 1 '' 0 0 0
+[[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+unset SBE_TEST_IP_LINK
+# NAT destinations not assigned locally are not guessed; failed detection
+# still permits an explicit host, while an empty answer cancels.
+export SBE_TEST_IP_ADDR='2: eth0 inet 10.0.0.2/24 scope global eth0'
+export SBE_TEST_IP_ROUTE='1.1.1.1 dev eth0 src 10.0.0.2 uid 0'
+export SSH_CONNECTION='10.0.0.1 12345 93.184.216.34 22'
+rm -f "$fixture/history"
+run_menu 1 1 2 1 '' 0 0 0
+[[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+unset SBE_TEST_IP_ADDR SBE_TEST_IP_ROUTE
+export SSH_CONNECTION=
+rm -f "$fixture/history"
+run_menu 1 1 2 1 '' 0 0 0
+[[ $(cat "$fixture/history") != *$'<view>\n<url>'* ]]
+run_menu 1 1 2 1 node.example.com '' 0 0 0
+[[ $(cat "$fixture/history") == *$'<--server>\n<node.example.com>'* ]]
 rm -f "$fixture/history"
 run_menu 2 3 'menu name' 1 300 1 '' 0 0
 [[ $(cat "$fixture/history") == *$'<account>\n<create>\n<--name>\n<menu name>\n<--bytes>\n<300000000000>'* ]]
