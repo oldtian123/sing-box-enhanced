@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -78,6 +80,56 @@ func (a *App) domains() ([]string, error) {
 	}
 	return result, nil
 }
+
+// Validate every bound runtime candidate before changing the shared policy.
+// Missing instance ports are planned in memory; preflight does not reserve them.
+func (a *App) preflightWarp(domains []string) ([]string, error) {
+	accounts, err := a.DB.Accounts()
+	if err != nil {
+		return nil, err
+	}
+	reserved := map[int]bool{}
+	var healthy []string
+	for _, account := range accounts {
+		status, err := a.DB.Status(account.ID, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if status.Allowed {
+			healthy = append(healthy, account.ID)
+		}
+		nodes, err := a.accountBindings(account.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(nodes) == 0 {
+			continue
+		}
+		var port int
+		err = a.DB.DB.QueryRow("SELECT stats_port FROM instances WHERE account_id=?", account.ID).Scan(&port)
+		if errors.Is(err, sql.ErrNoRows) {
+			if !status.Allowed {
+				// Reconcile cannot start this account, so it must not consume a
+				// prospective port ahead of an eligible account.
+				continue
+			}
+			port, err = a.availableStatsPort(reserved)
+		}
+		if err != nil {
+			return nil, err
+		}
+		reserved[port] = true
+		data, err := a.renderAccountConfig(nodes, port, domains)
+		if err == nil {
+			err = a.Manager.CheckBytes(account.ID, data)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("preflight WARP configuration for account %s: %w", account.ID, err)
+		}
+	}
+	return healthy, nil
+}
+
 func (a *App) warp(args []string) error {
 	domains, err := a.domains()
 	if err != nil {
@@ -127,12 +179,32 @@ func (a *App) warp(args []string) error {
 			result = append(result, domain)
 		}
 		sort.Strings(result)
+		healthy, err := a.preflightWarp(result)
+		if err != nil {
+			return err
+		}
+		previous := a.setting("warp_domains")
 		data, _ := json.Marshal(result)
 		if err = a.set("warp_domains", string(data)); err != nil {
 			return err
 		}
+		if err = a.reconcile(); err != nil {
+			if restoreErr := a.set("warp_domains", previous); restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("restore previous WARP rules: %w", restoreErr))
+			}
+			var failures []error
+			for _, id := range healthy {
+				// Reconcile respects current quotas, disabled state and StatsFault;
+				// configuration rollback must never clear a metering failure.
+				if restoreErr := a.reconcileAccount(id); restoreErr != nil {
+					failures = append(failures, fmt.Errorf("restore account %s after WARP failure: %w", id, restoreErr))
+				}
+			}
+			a.audit("warp domain change failed; previous rules restored")
+			return errors.Join(append([]error{err}, failures...)...)
+		}
 		a.audit("warp domain " + args[0] + " " + domain)
-		return a.reconcile()
+		return nil
 	default:
 		return errors.New("unknown WARP operation")
 	}

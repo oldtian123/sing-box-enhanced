@@ -66,6 +66,96 @@ func TestApplyPrivateConfigurationAndNoAutomaticStart(t *testing.T) {
 	}
 }
 
+func TestCheckBytesPrivateCandidatePreservesInstalledFiles(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		config  string
+		wantErr bool
+	}{
+		{"valid", `{"version":"candidate"}`, false},
+		{"invalid", "INVALID", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, log := fakeManager(t)
+			dir := m.instanceDir("alice")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(m.UnitDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			installed := map[string]string{
+				filepath.Join(dir, "config.json"):           `{"version":"current"}`,
+				filepath.Join(dir, "config.json.previous"):  `{"version":"previous"}`,
+				filepath.Join(m.UnitDir, UnitName("alice")): "unchanged unit\n",
+			}
+			for path, content := range installed {
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seen := filepath.Join(t.TempDir(), "candidate-path")
+			t.Setenv("SBE_TEST_CANDIDATE", seen)
+			// Inspect the candidate while it exists, including its private mode.
+			script := "#!/bin/sh\ncase \"$(LC_ALL=C ls -ld \"$3\")\" in -rw-------*) ;; *) exit 2;; esac\nprintf '%s\\n' \"$3\" > \"$SBE_TEST_CANDIDATE\"\ncase \"$(cat \"$3\")\" in *INVALID*) exit 1;; esac\n"
+			if err := os.WriteFile(m.Core, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.CheckBytes("alice", []byte(test.config)); (err != nil) != test.wantErr {
+				t.Fatalf("CheckBytes error = %v, want error %v", err, test.wantErr)
+			}
+			for path, content := range installed {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != content {
+					t.Fatalf("preflight modified installed file %s: %q, %v", path, data, err)
+				}
+			}
+			for _, path := range []string{m.Root, filepath.Join(m.Root, "instances"), dir} {
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != 0700 {
+					t.Fatalf("candidate directory is not private: %s, %v", path, err)
+				}
+			}
+			candidate, err := os.ReadFile(seen)
+			if err != nil || filepath.Dir(strings.TrimSpace(string(candidate))) != dir {
+				t.Fatalf("core did not inspect an account-scoped candidate: %q, %v", candidate, err)
+			}
+			if _, err := os.Stat(strings.TrimSpace(string(candidate))); !os.IsNotExist(err) {
+				t.Fatalf("candidate remains after preflight: %v", err)
+			}
+			if paths, err := filepath.Glob(filepath.Join(dir, ".candidate-*.json")); err != nil || len(paths) != 0 {
+				t.Fatalf("candidate files remain after preflight: %v, %v", paths, err)
+			}
+			if _, err := os.Stat(log); !os.IsNotExist(err) {
+				t.Fatalf("preflight unexpectedly called systemctl: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckBytesNewAccountDoesNotInstallConfigurationOrUnit(t *testing.T) {
+	m, log := fakeManager(t)
+	if err := m.CheckBytes("../unsafe", []byte(`{}`)); err == nil {
+		t.Fatal("unsafe account ID accepted")
+	}
+	if _, err := os.Stat(m.Root); !os.IsNotExist(err) {
+		t.Fatalf("invalid input created runtime files: %v", err)
+	}
+	if err := m.CheckBytes("new-account", []byte(`{"version":"candidate"}`)); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(m.instanceDir("new-account"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("new account preflight left files: %v, %v", entries, err)
+	}
+	if _, err := os.Stat(m.UnitDir); !os.IsNotExist(err) {
+		t.Fatalf("preflight created the systemd unit directory: %v", err)
+	}
+	if _, err := os.Stat(log); !os.IsNotExist(err) {
+		t.Fatalf("preflight unexpectedly called systemctl: %v", err)
+	}
+}
+
 func TestApplyValidationAndReloadFailuresPreservePriorConfig(t *testing.T) {
 	m, _ := fakeManager(t)
 	old := []byte(`{"version":"old"}`)

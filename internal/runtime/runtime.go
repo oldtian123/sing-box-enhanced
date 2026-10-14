@@ -63,6 +63,38 @@ func (m Manager) Check(configPath string) error {
 	return nil
 }
 
+// CheckBytes validates a private candidate without replacing any installed
+// configuration or unit and without performing service operations.
+func (m Manager) CheckBytes(accountID string, config []byte) error {
+	if err := m.validate(accountID); err != nil {
+		return err
+	}
+	for _, path := range []string{m.Root, filepath.Join(m.Root, "instances"), m.instanceDir(accountID)} {
+		if err := directory(path, 0700); err != nil {
+			return err
+		}
+	}
+	candidate, err := os.CreateTemp(m.instanceDir(accountID), ".candidate-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(candidate.Name())
+	defer candidate.Close()
+	if err := candidate.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := candidate.Write(config); err != nil {
+		return err
+	}
+	if err := candidate.Sync(); err != nil {
+		return err
+	}
+	if err := candidate.Close(); err != nil {
+		return err
+	}
+	return m.Check(candidate.Name())
+}
+
 func (m Manager) unit(accountID string) []byte {
 	configPath := filepath.Join(m.instanceDir(accountID), "config.json")
 	return []byte("[Unit]\nDescription=sing-box enhanced account " + accountID + "\nBindsTo=sing-box-enhanced-meter.service\nAfter=network-online.target sing-box-enhanced-meter.service\n\n[Service]\nType=simple\nUser=root\nUMask=0077\nExecStart=" + unitQuote(m.Core) + " run -c " + unitQuote(configPath) + "\nRestart=no\nKillMode=control-group\nTimeoutStopSec=10\nSendSIGKILL=yes\n\n")

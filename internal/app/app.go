@@ -104,8 +104,13 @@ func Run(args []string, out io.Writer) error {
 	if args[0] == "view" {
 		return runView(o, args[1:], out)
 	}
+	if args[0] == warpJobCommand {
+		return runWARPJobWorker(o, args[1:])
+	}
 	if len(args) >= 2 && args[0] == "warp" {
 		switch args[1] {
+		case "add", "remove":
+			return runWARPJob(o, args[1:], out)
 		case "register":
 			accepted := false
 			if _, err := commandFlags("warp register", args[2:], func(f *flag.FlagSet) {
@@ -702,6 +707,56 @@ func (a *App) reconcile() error {
 	return errors.Join(failures...)
 }
 
+func (a *App) accountBindings(id string) ([][]byte, error) {
+	rows, err := a.DB.DB.Query("SELECT inbound FROM bindings WHERE account_id=? ORDER BY id", id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	nodes := [][]byte{}
+	for rows.Next() {
+		var b []byte
+		if err = rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, b)
+	}
+	return nodes, rows.Err()
+}
+
+func (a *App) availableStatsPort(reserved map[int]bool) (int, error) {
+	port, err := freePort(30000)
+	for err == nil {
+		var used int
+		if err = a.DB.DB.QueryRow("SELECT COUNT(*) FROM instances WHERE stats_port=?", port).Scan(&used); err != nil {
+			return 0, err
+		}
+		if used == 0 && !reserved[port] {
+			return port, nil
+		}
+		port, err = freePort(port + 1)
+	}
+	return 0, err
+}
+
+func (a *App) renderAccountConfig(nodes [][]byte, port int, domains []string) ([]byte, error) {
+	base := []byte(`{"log":{"level":"warn","timestamp":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	if b, e := os.ReadFile(filepath.Join(a.Root, "base.json")); e == nil {
+		base = b
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return nil, e
+	}
+	warpPort := 40000
+	if p := a.setting("warp_port"); p != "" {
+		var err error
+		warpPort, err = strconv.Atoi(p)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return config.Render(base, nodes, port, domains, warpPort)
+}
+
 func (a *App) reconcileAccount(id string) error {
 	status, err := a.DB.Status(id, time.Now())
 	if err != nil {
@@ -710,21 +765,7 @@ func (a *App) reconcileAccount(id string) error {
 	if !status.Allowed || a.setting("paused") == "1" {
 		return a.stopAccount(id, true)
 	}
-	rows, err := a.DB.DB.Query("SELECT inbound FROM bindings WHERE account_id=? ORDER BY id", id)
-	if err != nil {
-		return err
-	}
-	nodes := [][]byte{}
-	for rows.Next() {
-		var b []byte
-		if err = rows.Scan(&b); err != nil {
-			rows.Close()
-			return err
-		}
-		nodes = append(nodes, b)
-	}
-	err = rows.Err()
-	rows.Close()
+	nodes, err := a.accountBindings(id)
 	if err != nil {
 		return err
 	}
@@ -735,22 +776,9 @@ func (a *App) reconcileAccount(id string) error {
 	var generation, processID, oldHash string
 	err = a.DB.DB.QueryRow("SELECT stats_port,generation,process_id,config_hash FROM instances WHERE account_id=?", id).Scan(&port, &generation, &processID, &oldHash)
 	if errors.Is(err, sql.ErrNoRows) {
-		port, err = freePort(30000)
+		port, err = a.availableStatsPort(nil)
 		if err != nil {
 			return err
-		}
-		var used int
-		for {
-			if err = a.DB.DB.QueryRow("SELECT COUNT(*) FROM instances WHERE stats_port=?", port).Scan(&used); err != nil {
-				return err
-			}
-			if used == 0 {
-				break
-			}
-			port, err = freePort(port + 1)
-			if err != nil {
-				return err
-			}
 		}
 		generation = randomID("g-")
 		_, err = a.DB.DB.Exec("INSERT INTO instances(account_id,stats_port,generation) VALUES(?,?,?)", id, port, generation)
@@ -758,24 +786,11 @@ func (a *App) reconcileAccount(id string) error {
 	if err != nil {
 		return err
 	}
-	base := []byte(`{"log":{"level":"warn","timestamp":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
-	if b, e := os.ReadFile(filepath.Join(a.Root, "base.json")); e == nil {
-		base = b
-	} else if !errors.Is(e, os.ErrNotExist) {
-		return e
-	}
 	domains, err := a.domains()
 	if err != nil {
 		return err
 	}
-	warpPort := 40000
-	if p := a.setting("warp_port"); p != "" {
-		warpPort, err = strconv.Atoi(p)
-		if err != nil {
-			return err
-		}
-	}
-	data, err := config.Render(base, nodes, port, domains, warpPort)
+	data, err := a.renderAccountConfig(nodes, port, domains)
 	if err != nil {
 		_ = a.DB.SetFault(id, true)
 		_ = a.stopAccount(id, false)
@@ -794,6 +809,9 @@ func (a *App) reconcileAccount(id string) error {
 		_ = a.DB.SetFault(id, true)
 		return errors.New("account core exited unexpectedly; recover explicitly after checking metering")
 	}
+	if err = a.Manager.CheckBytes(id, data); err != nil {
+		return err
+	}
 	if running {
 		if err = a.collect(id); err != nil {
 			return err
@@ -810,8 +828,10 @@ func (a *App) reconcileAccount(id string) error {
 		}
 	}
 	if _, err = a.Manager.Apply(id, data); err != nil {
-		_ = a.DB.SetFault(id, true)
-		return err
+		// Metering and the planned Stop already succeeded. No new process has
+		// started, so a configuration failure must not become a meter fault;
+		// the caller can restore the prior policy with a fresh generation.
+		return fmt.Errorf("apply configuration for account %s before start: %w", id, err)
 	}
 	generation = randomID("g-")
 	if _, err = a.DB.DB.Exec("UPDATE instances SET generation=?,process_id='',config_hash=? WHERE account_id=?", generation, hash, id); err != nil {
